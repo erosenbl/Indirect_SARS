@@ -1,0 +1,1302 @@
+---
+title: "Indirect Transmission Risk Analysis"
+author: "Elias Rosenblatt"
+date: "2024-07-01"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(scales)
+library(sf)
+library(ggridges)
+library(gridExtra)
+```
+
+In addition to the packages loaded above, users need to install and load the package whitetailedSIRS from GitHub.
+```{r}
+#Code to install whitetailedSIRS from GitHub
+# # Install githubinstall and devtools packages if not installed already
+# install.packages("githubinstall")
+# install.packages("devtools")
+# 
+# # Load the packages
+# library(githubinstall)
+# library(devtools)
+# 
+# # Function to download the package
+# devtools::install_github("disease-decision-analysis-and-research/whitetailedSIRS")
+
+library(whitetailedSIRS)
+```
+
+This RMarkdown document details the analysis supporting the manuscript "Fomites could determine severity of SARS-CoV-2 outbreaks in low-density white-tailed deer (Odocoileus virginianus) populations". The analysis consists of 4 parts, including:
+
+1.    Compile estimated and derived parameters for both indirect and direct transmission pathways
+2.    Project outbreaks using SIRS ODEs modified from the whitetailedSIRS package (Rosenblatt et al. 2023), and estimate cumulative Force of Infection (FOI) considering both direct and indirect transmission pathways;
+3.    Evaluate sensitivity of outbreaks to FOI and basic reproductive number (R0), and thus identify when increases in FOI from indirect transmission most alter outbreak dynamics of SARS-CoV-2 in deer;
+4.    And describe the prevalence and distribution of deer population segments across the contiguous US that may be sensitive to the increased burden of indirect transmission pathways.
+
+Calculations and projects will be made for a wild deer population in a suburban environment. This code will incorporate direct and indirect transmission pathways from humans, between deer, and from deer in captive facilities. Figures created in this RMD file match those presented in the manuscript, with figure number references noted.
+
+## Step 1
+Compile parameters for calculating probability of infection and force of infection (FOI) for both indirect and direct transmission pathways
+
+#### Step 1.a. Set constraints on simulations and bring in elicitation data
+```{r base_simulations}
+set.seed(23) #set seed for reproduction
+nsamples <- 1000 #Set number of random draws from parameter distributions
+
+elicitation_data <- whitetailedSIRS::draw_elicitation_samples(nsamples = nsamples) #Bring in expert elicited estimates for parameter distributions otherwise unavailable
+```
+
+#### Step 1.b. Calculate parameters needed to estimate probability of infection and force of infection for direct transmission parameters
+Wild deer only
+```{r SIR_params}
+#Set up wild deer densities and habitat parameters for contact rates
+nWild <- rpois(nsamples,1000) #Draw random number of deer...
+A_w <- 100 #...per 100km2
+habitat <- "med" #With a medium habitat classification, meaning 26% wooded cover (see help file for whitetailedSIRS::calc_contact_rate)
+
+#Direct contact probability between wild deer given proximity
+epsilon_dc <- whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = "Direct Contact Probability") #Probability of direct contact between deer, given proximity.
+
+#Viral loads in saliva (genomic copies per ml saliva)
+C_nu_human <- rnorm(n = nsamples, mean = 10^5.6, sd = 10^1.2) #See Table S1 in manuscript for reference
+C_nu_deer <- 10^5.6 * whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = "Viral Load") #deer, relative to humans, drawn from expert elicited values (see Rosenblatt et al. 2023)
+
+#Dose-response coefficient for deer
+r_deer <- whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = "Dose-Response") #Deer dose-response to SARS-CoV-2, estimated from expert elicited values (see Rosenblatt et al. 2023).
+
+#Infection probability calculation of aerosol transmission from deer-to-deer
+t_contact_deer_deer_null <- whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = "Deer Proximity Duration (minutes)") #Duration of deer-deer proximity event, estimated from expert elicited values (see Rosenblatt et al. 2023).
+
+gamma_recov <- rep(1/6, nsamples) #Recovery rate, based off of a 6 day recovery.
+alpha_immunity_null <- 1 / whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = 'Temporary Immunity') #Duration of gained immunity after infection, estimated from expert elicited values (see Rosenblatt et al. 2023).
+I_human_null <- 0.05 #Fixed and assumed human prevalence
+
+#Derived parameters for infection probabilities and force-of-infection calculations for direct transmission to and within a wild, suburban deer population.
+omega_ww_wild <- whitetailedSIRS::calc_contact_rate(nsamples = nsamples, type_contact = habitat, N_w = nWild) #Proximity rate between wild deer in 26% wooded cover (Habib et al. 2011)
+omega_hw_wild <- whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = "Deer-Human Proximity Rate, Suburban (per 120 days)") /120 #Proximity rate between humans and wild deer, estimated from expert elicited values (see Rosenblatt et al. 2023).
+
+t_contact_deer_human_wild <- whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = "Deer-Human Proximity Duration, Suburban (minutes)") #Duration of human- wild deer proximity event, estimated from expert elicited values (see Rosenblatt et al. 2023).
+
+sigma_aero_deer_deer_wild <- whitetailedSIRS::calc_sigma_aero(C_nu = C_nu_deer,
+                                        t_contact = t_contact_deer_deer_null / 60,
+                                        r = r_deer, nsamples = nsamples, AER = rep(4, nsamples)) #Derived probability of infection for a susceptible, wild deer in proximity with a infected, wild deer.
+
+sigma_aero_deer_human_wild <- whitetailedSIRS::calc_sigma_aero(ER = 0.53, C_nu = C_nu_human, 
+                                        t_contact = t_contact_deer_human_wild / 60,
+                                        r = r_deer, nsamples = nsamples, AER = rep(4, nsamples)) #Derived probability of infection for a susceptible, wild deer in proximity with a infected human.
+
+sigma_dc_deer_deer <- whitetailedSIRS::calc_sigma_dc(C_nu = C_nu_deer, nsamples = nsamples) #Calculate infection probability for a susceptible deer given physical contact with a infected deer, assuming 0.1ml of saliva was transferred on contact.
+```
+
+Wild deer that can interact with captive deer across fencelines
+```{r}
+#Wild-captive complex, direct only, contact rates (wild side remain the same)
+omega_cw_wild_captive <- 0.00072 / whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = "Direct Contact Probability") #Proximity rate between wild and captive deer along fenceline (events per day). Numerator is drawn from Vercauteren et al. (2007) and Khouri et al. (2022), and the denominator is estimated from expert elicited values (see Rosenblatt et al. 2023).
+omega_cc_wild_captive <- whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = "Deer-Deer Proximity Rate, Captive (per day)") #Proximity rate between captive deer, estimated from expert elicited values (see Rosenblatt et al. 2023).
+omega_hc_wild_captive <- whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = "Deer-Human Proximity Rate, Captive (per 120 days)") /120 #Proximity rate between humans and captive deer, estimated from expert elicited values (see Rosenblatt et al. 2023).
+
+
+sigma_aero_deer_deer_wild_captive <- whitetailedSIRS::calc_sigma_aero(C_nu = C_nu_deer,
+                                            t_contact = t_contact_deer_deer_null / 60,
+                                            r = r_deer, nsamples = nsamples, AER = rep(1, nsamples)) #Derived probability of infection for a susceptible, wild deer in proximity with a infected, wild deer.
+
+t_contact_deer_human_wild_captive <- whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = "Deer-Human Proximity Duration, Captive (minutes)") #Duration of human-captive deer proximity event, estimated from expert elicited values (see Rosenblatt et al. 2023).
+
+sigma_aero_deer_human_wild_captive <- whitetailedSIRS::calc_sigma_aero(ER = 0.53, C_nu = C_nu_human, 
+                                            t_contact = t_contact_deer_human_wild_captive / 60,
+                                            r = r_deer, nsamples = nsamples, AER = rep(1, nsamples)) #Derived probability of infection for a susceptible, captive deer in proximity with a infected human.
+```
+
+
+#### Step 1.c. Calculate parameters needed to estimate probability of infection and force of infection for indirect transmission parameters
+```{r common_pars, message=FALSE}
+source("Functions/predWasteC.R") #Function to estimate human prevalence from concentration of SARS-CoV-2 in raw sewage.
+source("Functions/pInfectPFU.R") #Function to estimate the probability of infection from plaque-forming unit measurement for SARS-CoV-2.
+
+#Common parameters
+gc2PFU <- rep(5.2, nsamples) #Conversion from GC to PFU
+decayFomite <- log(2)/3.46 #Converting halflife from van Doremalen et al. 2020 to decay rate constant 
+decayWastewater <- 1.1 #Bivins et al. 2020 decay rate constant
+```
+
+##### Step 1.c.i. Calculate parameters and estimate probability of infection from wastewater
+Use discharge data for streams and rivers across white-tailed deer range to estimate the probability of a water source received wastewater discharge.
+```{r, wastewaterCalc, message = FALSE, warning=FALSE, echo=FALSE}
+#Summarize contamination levels across deer densities.
+discharge <- read.csv("Data/RiverContaminationAcrossDeerRange.csv") #Load data summarzing proportion of wastewater effluent in stream/river discharge, derived from Ehalt Macedo et al. (2022), across white-tailed deer range in the U.S. (Walters et al. 2016).
+
+discharge %>% 
+  summarize(., NonZero = sum(PERCENT_WA > 0), Greater1Per = sum(PERCENT_WA > 1), All = length(PERCENT_WA)) %>% 
+  mutate(., PropAny = NonZero/All, PropGreater1Per = Greater1Per/All) -> ProbContam #Summarize the probability of discharge with any wastewater contribution (ProbAny) and the probability of wastewater comprising >1% of discharge (PropGreater1Per).
+```
+
+Arrange necessary parameters and derived parameters to estimate probability of infection from wastewater.
+```{r}
+#Step 1: Calculate raw sewage viral load
+model <- readRDS("Data/PFUWastePosRelationship.RDS") #Bring in linear regression fitted on data from Zaneti et al. 2021, explaining the relationship between human prevalence and SARS-CoV-2 PFU concentration in raw sewage.
+pred <- pred.waste.C(humanPositivity = I_human_null, model = model) #Predict SARS-CoV-2 PFU concentration in raw sewage from 5% human prevalence using the above regression model.
+rawC <- rlnorm(n=nsamples, meanlog = pred$fit, sdlog = pred$se.fit)*1000 #multiplied by 1000 to convert to PFU per liter
+
+#Step 2: raw sewage enters treatment
+treatmentReduction <- runif(n = nsamples, min = 3, max = 5) #random draw for log-reduction in treatment facility
+
+#Step 3: treated effluent is released into natural water body and decays
+Dilution <- sample(discharge$PERCENT_WA[which(discharge$PERCENT_WA<= quantile(discharge$PERCENT_WA, c(0.995)) & discharge$PERCENT_WA>0)], size = nsamples, replace = TRUE) #sample dilution from 99.5% percent of waterways.
+Decay  <- runif(nsamples, min = 0, max = 96) #Random draw of decay period (hours) until ingestion by susceptible, wild deer.
+
+#Step 4: deer ingests its daily water requirement from contaminated source
+vec.trans <- sample(seq(0.1,0.9,by = 0.1), nsamples, replace = TRUE) #Acknowledge uncertainty around transfer efficiency of virus via ingestion of water.
+```
+
+Calculate dose received and probability of infection from a susceptible deer drinking water contaminated with SARS-CoV-2.
+```{r}
+df.sewage <- data.frame(rawC = rawC, treatRed = treatmentReduction, treatC = NA, dilution = Dilution, diluteC = NA, decayT = Decay, decayC = NA, transferEff = vec.trans, dose = NA, pinfect=NA) #Create dataframe for each simulation that includes raw sewage SARS-CoV-2 concentration, log-reduction achieved by treatment, dilution in waterway, decay, transfer efficiency. Code below fills in concentrations after treatment (treatC), dilution (diluteC), and decay (DecayC), as well as the dose received by a susceptible, wild deer (dose), and the resulting probability of that deer getting infected with SARS-CoV-2.
+
+
+df.sewage %>% 
+  mutate(treatC = rawC/(10^treatRed)) %>%  #Step 2: Concentration after treatment
+  mutate(diluteC = treatC*Dilution) %>% #Step 3: Concentration after dilution
+  mutate(decayC = diluteC*exp(-decayWastewater*(Decay/24))) %>% #Step 4: Concentration after decay
+  mutate(dose = decayC*3.61) %>% #Deer drinks daily water requirement (L)
+  mutate(pinfect = pInfectPFU(dose = dose, eff = transferEff)) %>% #Calculate probability of infection given dose received
+  mutate(ProbabilityInfection_Base10 = log10(pinfect)) %>% #Scale probability of infection on log10 scale
+  mutate(treatRed = as.factor(treatRed),transferEff = as.factor(transferEff), DecayHours = Decay)-> sewage.results #Format and save sewage results
+
+
+#Save pInfect for wastewater
+WW.treated <- sewage.results$pinfect 
+```
+
+##### Step 1.c.ii. Calculate parameters needed to estimate probability of infection and force of infection from food waste
+This step is relatively simple. The following code chunk pulls various parameters together to calculate the probability of infection for a susceptible deer ingesting a apple core contaminated with SARS-CoV-2 from an infected human.
+```{r HuntersApple}
+humanSalivaLoad <-  rnorm(n = nsamples,mean = 10^5.6, sd = 10^1.2) #Define human saliva load
+appleCoreSA <- 2*pi*runif(n=nsamples, min = 1.9/2, max = 3.175/2)*runif(n=nsamples, min = 5.4, max = 7.62)  #Calculate surface area of an eaten apple core (2*pi*radius of core*length of core)
+salTrans <- sample(x = seq(0.1,0.9,by = 0.1), nsamples, replace = TRUE) #Saliva transfer efficiency to apple
+salThick <- rep(0.1/10, nsamples) #Saliva thickness in mouth prior to transfer (cm)
+decayT <- sample(x = seq(1,96*60,by=1), nsamples, replace = TRUE)/60 #Define decay time range in hours
+vec.trans <- sample(seq(0.1,0.9,by = 0.1), nsamples, replace = TRUE) #Efficiency of viral infection via ingestion
+  
+df.apple <- data.frame("Load" = humanSalivaLoad,"Conversion" = gc2PFU, "appleSurfaceArea" = appleCoreSA, "salivaTransfer" = salTrans, "salivaThickness"=salThick, "decayTime"=decayT, "ingestionEfficiency" = vec.trans) #Pull parameters together into a dataframe. Probability of infection will be calculated using these parameters.
+
+df.apple %>% 
+  mutate(LoadPFU = Load/(10^Conversion)) %>% #Convert RNA to PFU
+  mutate(., salVolume= appleSurfaceArea*salivaThickness*salivaTransfer) %>% #Volume of saliva transferred
+  mutate(., appleLoad = LoadPFU*salVolume)  %>% #initial viral load given saliva transferred
+  mutate(., dose = appleLoad*exp(-decayFomite*decayTime)) %>% #Dose received after decay time
+    mutate(., pinfect = pInfectPFU(dose = dose, eff = ingestionEfficiency)) %>% #Dose is ingested, calculate probability of infection
+    mutate(., pinfect_Base10 = log10(pinfect))-> df.apple #Transform factors and save DF
+
+#Save pInfect for food waste
+food_waste <- df.apple$pinfect
+```
+
+##### Step 1.c.iii. Calculate parameters needed to estimate probability of infection and force of infection from feed pile
+The following code chunk pulls various parameters together to calculate the probability of infection for a susceptible deer ingesting corn from a feed pile contaminated with SARS-CoV-2 from an infected deer. 
+```{r, backyardPile}
+deerSalivaLoad <-  rnorm(n = nsamples,mean = 10^5.6, sd = 10^1.2)*whitetailedSIRS::get_EE_param_vals(data = elicitation_data, my_param = "Viral Load") #Draw deer saliva SARS-CoV-2 concentrations
+
+#Infected deer comes up and eats, contaminating a variable amount surrounding feed that was eaten. This variable amount is determined by a) the number of kernels on contact, b) the mean proportion of the surface area contacted (1-50%; ranging from brief contact to contacting the entire exposed kernel in a pile of corn), and the number of kernels contacted.
+cornKernelSA <- rep(151.40*0.01,nsamples) #Kernel surface area (cm2), converted from mm2, Karababa and Cokuner (2007)
+cornKernelContact <- sample(seq(1:1000), nsamples, replace = TRUE) #Draw of number of corn kernels contacted, contaminated, but not consumed by infectious deer
+salTrans <- sample(seq(0.1,0.9,by = 0.1),nsamples, replace = TRUE) #Proportion of saliva thickness transferred on contact
+salThick <- rep(0.1/10, nsamples) #thickness of saliva in mouth (cm)
+
+#Contaminated feed sits until a susceptible deer comes, and decays
+decayT <- sample(seq(1,96*60,by=1), nsamples, replace = TRUE)/60 #Calculates decay time
+
+#Susceptible deer eats all of the contaminated feed at the same time
+vec.trans <- sample(seq(0.1,0.9,by = 0.1), nsamples, replace = TRUE) #Acknowledges uncertainty of transfer efficiency of SARS-CoV-2 for ingesting food.
+
+#Create dataframe
+df.corn <- data.frame("Load" = deerSalivaLoad,"Conversion" = gc2PFU, "CornSurfaceArea" = cornKernelSA,"kernelsContacted" = cornKernelContact, SAKernels = NA, "salivaTransfer" = salTrans, "salivaThickness"=salThick, "decayTime"=decayT, "Transfer" = vec.trans) #Creates dataframe with all parameters needed to calculate probability of infection.
+
+df.corn %>% 
+  rowwise() %>% 
+  dplyr::mutate(.,SAKernels = sum(sample(seq(0.01,0.5,by = 0.01), size = kernelsContacted, replace = TRUE)*CornSurfaceArea)) %>% #Calculate total surface area contaminated that is consumed by a susceptible deer.
+  dplyr::mutate(LoadPFU = Load/(10^Conversion), salVolume= SAKernels*salivaThickness*salivaTransfer, cornLoad = LoadPFU*salVolume)  %>% #Calculate the amount of SARS-CoV-2 on contaminated feed
+  dplyr::mutate(dose = cornLoad*exp(-decayFomite*decayTime)) %>% #Calculate dose received by susceptible deer after decay
+    dplyr::mutate(., pinfect = pInfectPFU(dose = dose, eff = Transfer)) %>% #Calculate probability of infection
+    dplyr::mutate(., pinfect_Base10 = log10(pinfect)) %>% #log-10 probability of infection
+    dplyr::mutate(Conversion = as.factor(Conversion), salivaTransfer = as.factor(salivaTransfer),
+           Transfer = as.factor(Transfer)) -> df.corn
+
+#Save pInfect for feed pile
+feed_pile <- df.corn$pinfect 
+```
+
+#### Step 1.d: Calculate contact rate and FOI for indirect transmission sources
+
+##### Step 1.d.i Contact rate and FOI with contaminated wastewater 
+
+Here, we calculate the FOI for contaminated wastewater. In Step 1.c.i, we calculated the probability of infection based on raw sewage viral load from a 5% prevalence in the human population. Therefore, human prevalence has already been incorporated into this calculation. The remaining multiplier is the contact rate with contaminated waterways. From the objective 1 RMD, we calculated the proportion of waterways contaminated with wastewater effluent across white-tailed deer range in the United States. To calculate contact rate probability for this hazard, we need to multiply by the availability of stream and river water from all surface waters. 
+```{r}
+
+# Read in surface water data to estimate the proportion of surface water that are rivers, by county. Data comes from ARCGIS.
+surface_waters <- read.csv("Data/Waterbodies_clipped_to_deer.csv")
+
+surface_waters$FTYPE <- as.factor(surface_waters$FTYPE) #Turn surface water type to factor
+
+surface_waters %>% 
+  dplyr::filter(., FTYPE %in% c("Canal/Ditch", "Lake/Pond", "Reservoir", "Stream/River", "Swamp/Marsh")) %>% #Filter out Ice Mass, Inundation Area, and Playa
+  dplyr::mutate(., State_County = factor(paste0(STATEFP,".",COUNTYFP))) %>% #Label by state.county
+  dplyr::group_by(., State_County, FTYPE) %>% 
+  dplyr::summarise(., Area = sum(SQKM),
+               Count = length(FTYPE)) -> surface_water_summary  #Summarize Area and count of water types by state.county levels
+
+#Prep river and stream only summary
+surface_water_summary %>% 
+  dplyr::filter(.,FTYPE == "Stream/River") %>% #Filter only streams/rivers (to match the discharge data available)
+  dplyr::rename(., River.area = Area,
+            River.count = Count)-> river_stream_summary
+
+surface_water_summary %>% 
+  dplyr::group_by(., State_County) %>% 
+  dplyr::summarise(., Area.Total = sum(Area),
+               Total.Count = sum(Count)) %>% #Summarise total surface area of water in each state
+  dplyr::left_join(., river_stream_summary[, c("State_County", "River.area", "River.count")], by = "State_County") %>% 
+  replace(is.na(.), 0) %>% 
+  dplyr::mutate(., Proportion.Area.River = River.area/Area.Total,
+            Proportion.Count.River = River.count/Total.Count) %>% #Calculate proportion of area and count of surface waters that are streams/rivers
+  dplyr::filter(., is.finite(Proportion.Count.River),
+            Proportion.Count.River > 0,
+            Proportion.Count.River < 1) -> Surface_Water
+
+#Will use proportional count of rivers/surface water sources to avoid bias due to area
+Surface_Water %>% 
+  dplyr::select(., State_County, Proportion.Count.River) -> Rivers
+
+# Read in original discharge dataset (again)
+discharge <- read.csv("Data/RiverContaminationAcrossDeerRange.csv")
+
+# Summarize proportion of streams/rivers contaminated by county number for contact rate sampling
+discharge %>% 
+  dplyr::mutate(., State_County = factor(paste0(STATEFP,".",COUNTYFP))) %>% 
+  dplyr::group_by(., State_County) %>% 
+  dplyr::summarize(., Proportion.Contaminated = sum(PERCENT_WA > 0)/length(PERCENT_WA)) %>% 
+  dplyr::select(., State_County, Proportion.Contaminated) -> WW_contact_by_county 
+
+#Combine proportion of rivers (by count) and proportion of streams contaminated
+merge(Rivers, WW_contact_by_county, by = "State_County") %>% 
+  mutate(., contact.rate = Proportion.Count.River * Proportion.Contaminated) -> wastewater_risk
+
+#Turn probability of infection into a tibble
+WW.results <- tibble(p_infect = WW.treated)
+
+# Use contact rate to calculate FOI from probability of infections
+WW.results$contact.rate <- sample(wastewater_risk$contact.rate, size = nrow(WW.results))
+
+# Prevalence is fixed at 5% in humans, and is already integrated into the probability of infection calculation
+WW.results$prevalence <- I_human_null
+
+# Calculate FOI as the product of probability of infection and contact rate
+WW.results$FOI <- WW.results$p_infect * WW.results$contact.rate
+
+#Beta calculation is the same as FOI, as prevalence is integrated into p_contact rate. Incidence of river contamination will be omitted in SIRS ODEs.
+
+WW.results$Beta <- WW.results$FOI
+```
+
+##### Step 1.d.ii Contact rate and FOI with contaminated food waste 
+Here, we calculate the FOI for contaminated food waste. In Step 1.c.ii, we calculated the probability of infection based on consumption of one apple core. We multiply this estimate of infection probability by a contact rate of 0-10 contaminated apples per day (drawn from a uniform distribution), and a human prevalence of 5%.
+
+```{r}
+
+#Turn probability of infection into a tibble
+food_waste.results <- tibble(p_infect = food_waste)
+
+# Use contact rate of 0 - 10 apples per day to calculate FOI from probability of infections
+food_waste.results$contact.rate <- runif(n = nrow(food_waste.results), min = 0, max = 10)
+
+# Prevalence is fixed at 5% in humans
+food_waste.results$prevalence <- I_human_null
+
+# Calculate FOI as the product of probability of infection, contact rate, and human prevalence
+food_waste.results$FOI <- food_waste.results$p_infect * food_waste.results$contact.rate * food_waste.results$prevalence
+
+#Calculate Beta
+food_waste.results$Beta <- food_waste.results$p_infect * food_waste.results$contact.rate
+
+```
+
+##### Step 1.d.ii Contact rate and FOI with contaminated food waste 
+
+Here, we calculate the FOI for contaminated feed pile. In Step 1.c.iii, we calculated the probability of infection based on consumption in one sitting, varying from a small number to a large number of kernels contaminated. We multiply this estimate of infection probability by a contact rate of 0-1 feed piles servings eaten at per day, and a deer prevalence drawn from the deer SIRS model.
+
+```{r}
+
+#Turn probability of infection into a tibble
+feed_pile.results <- tibble(p_infect = feed_pile)
+
+# Use contact rate of 0 - 1 feed pile per day to calculate FOI from probability of infections
+feed_pile.results$contact.rate <- runif(n = nrow(feed_pile.results), min = 0, max = 1)
+
+# Prevalence is drawn from the SIRS model results from Rosenblatt et al. 2023
+feed_pile.results$prevalence <- runif(min = 4e-6, max = 0.069, n = nrow(feed_pile.results))
+
+# Calculate FOI as the product of probability of infection, contact rate, and human prevalence
+feed_pile.results$FOI <- feed_pile.results$p_infect * feed_pile.results$contact.rate * feed_pile.results$prevalence
+
+# Calculate Beta as the product of probability of infection, contact rate, and human prevalence
+feed_pile.results$Beta <- feed_pile.results$p_infect * feed_pile.results$contact.rate
+
+```
+
+## Step 2
+Project outbreaks using SIRS ODEs modified from the whitetailedSIRS package (Rosenblatt et al. 2023), and estimate cumulative FOI and spread between deer (R0), considering both direct and indirect transmission pathways;
+
+#### Step 2.a. Derive parameters used in the SIRS ODE equation set.
+We create derived parameters for each scenario, with wild deer in a suburban setting with and without intensive captive facilities. Here we use the alternative_indirect_and_direct function included in this code release to prepare parameters for use with SIRS ODEs.
+```{r }
+source("Functions/alternative_indirect_and_direct.R") #load function
+
+#Direct transmission only, wild deer only
+direct.wild.params <- alternative_indirect_and_direct(omega_ww = omega_ww_wild, omega_cw = rep(0, nsamples), omega_cc = rep(0, nsamples), omega_hw = omega_hw_wild, omega_hc = rep(0, nsamples), omega_wastewater = rep(0, nsamples), omega_foodwaste = rep(0, nsamples), omega_feedpile = rep(0, nsamples), sigma_aero_deer_deer_wild = sigma_aero_deer_deer_wild, sigma_aero_deer_deer_captive = rep(0, nsamples), sigma_aero_deer_human_wild = sigma_aero_deer_human_wild,  sigma_aero_deer_human_capt = rep(0, nsamples), sigma_dc_deer_deer = sigma_dc_deer_deer, sigma_wastewater = rep(0, nsamples), sigma_foodwaste = rep(0, nsamples), sigma_feedpile = rep(0, nsamples), alpha_immunity = alpha_immunity_null, epsilon_dc = epsilon_dc, gamma_recov = gamma_recov, I_human = rep(I_human_null, nsamples), boost = rep(0, nsamples))
+
+#Direct transmission only, wild deer interact with captive deer
+direct.system.params <- alternative_indirect_and_direct(omega_ww = omega_ww_wild, omega_cw = omega_cw_wild_captive, omega_cc = omega_cc_wild_captive, omega_hw = omega_hw_wild, omega_hc = omega_hc_wild_captive, omega_wastewater = rep(0, nsamples), omega_foodwaste = rep(0, nsamples), omega_feedpile = rep(0, nsamples), sigma_aero_deer_deer_wild = sigma_aero_deer_deer_wild, sigma_aero_deer_deer_captive = sigma_aero_deer_deer_wild_captive, sigma_aero_deer_human_wild = sigma_aero_deer_human_wild,  sigma_aero_deer_human_capt = sigma_aero_deer_human_wild_captive, sigma_dc_deer_deer = sigma_dc_deer_deer, sigma_wastewater = rep(0, nsamples), sigma_foodwaste = rep(0, nsamples), sigma_feedpile = rep(0, nsamples), alpha_immunity = alpha_immunity_null, epsilon_dc = epsilon_dc, gamma_recov = gamma_recov, I_human = rep(I_human_null, nsamples), boost = rep(0, nsamples))
+
+#Direct and indirect transmission, wild deer only
+full.wild.params <- alternative_indirect_and_direct(omega_ww = omega_ww_wild, omega_cw = rep(0, nsamples), omega_cc = rep(0, nsamples), omega_hw = omega_hw_wild, omega_hc = rep(0, nsamples), omega_wastewater = WW.results$contact.rate, omega_foodwaste = food_waste.results$contact.rate, omega_feedpile = feed_pile.results$contact.rate, sigma_aero_deer_deer_wild = sigma_aero_deer_deer_wild, sigma_aero_deer_deer_captive = rep(0, nsamples), sigma_aero_deer_human_wild = sigma_aero_deer_human_wild,  sigma_aero_deer_human_capt = rep(0, nsamples), sigma_dc_deer_deer = sigma_dc_deer_deer, sigma_wastewater = WW.results$p_infect, sigma_foodwaste = food_waste.results$p_infect, sigma_feedpile = feed_pile.results$p_infect, alpha_immunity = alpha_immunity_null, epsilon_dc = epsilon_dc, gamma_recov = gamma_recov, I_human = rep(I_human_null, nsamples), boost = rep(0, nsamples))
+
+#Direct and indirect transmission only, wild deer interact with captive deer
+full.system.params <- alternative_indirect_and_direct(omega_ww = omega_ww_wild, omega_cw = omega_cw_wild_captive, omega_cc = omega_cc_wild_captive, omega_hw = omega_hw_wild, omega_hc = omega_hc_wild_captive, omega_wastewater = WW.results$contact.rate, omega_foodwaste = food_waste.results$contact.rate, omega_feedpile = feed_pile.results$contact.rate, sigma_aero_deer_deer_wild = sigma_aero_deer_deer_wild, sigma_aero_deer_deer_captive = sigma_aero_deer_deer_wild_captive, sigma_aero_deer_human_wild = sigma_aero_deer_human_wild,  sigma_aero_deer_human_capt = sigma_aero_deer_human_wild_captive, sigma_dc_deer_deer = sigma_dc_deer_deer, sigma_wastewater = WW.results$p_infect, sigma_foodwaste = food_waste.results$p_infect, sigma_feedpile = feed_pile.results$p_infect, alpha_immunity = alpha_immunity_null, epsilon_dc = epsilon_dc, gamma_recov = gamma_recov, I_human = rep(I_human_null, nsamples), boost = rep(0, nsamples))
+```
+
+#### Step 2.b. Fit SIRS ODEs for parameter sets
+
+Here we define initial conditions for simulated wild deer populations to project SARS-CoV-2 outbreaks. The following chunk uses three functions include with this code release to solve SIRS ODE equations. run_direct_and_indirect() solves the SIRS ODE equations given the parameters given, using the SIRS ODE equations that include both direct and indirect transmission (defined in direct_and_indirect_SIRS and direct_and_indirect_SIRS_with_cumulative). In addition to calculating prevalence through time, these nested functions (direct_and_indirect_SIRS and direct_and_indirect_SIRS_with_cumulative) calculate probability of persistence and incidence proportion, respectively. These nested functions require seperate initial conditions given how the data need to be structured.
+
+Note: This chunk takes some time to run, ~14 minutes
+```{r}
+start.time <- Sys.time()
+#Source necessary functions
+source("Functions/run_direct_and_indirect.R")
+source("Functions/direct_and_indirect_SIRS.R")
+source("Functions/direct_and_indirect_SIRS_with_cumulative.R")
+
+#Wild, suburban deer only (no captive deer on the landscape)
+
+initial <- whitetailedSIRS::initial_compartments(S_wild_prop = 1, I_wild_prop = 0, R_wild_prop = 0, S_captive_prop = 0, I_captive_prop = 0, R_captive_prop = 0, draws = nsamples, steady = FALSE) #Initial conditions for function that reports prevalence and persistence
+
+initial_steady <-  whitetailedSIRS::initial_compartments(S_wild_prop = 1, I_wild_prop = 0, R_wild_prop = 0, S_captive_prop = 0, I_captive_prop = 0, R_captive_prop = 0, draws = nsamples, steady = TRUE) #Initial condition for function that reports incidence proportion
+
+times = seq(1,120,1) #Set projection for 120 days (fall season)
+
+Direct_only <- run_direct_and_indirect(iter = nsamples,initial_compartments = initial, initial_compartments_steady = initial_steady, params = direct.wild.params, times = times, name = "Direct") #Project outbreaks in wild populations with direct transmission only
+
+Full <- run_direct_and_indirect(iter = nsamples,initial_compartments = initial, initial_compartments_steady = initial_steady, params = full.wild.params, times = times, name = "Full") #Project outbreaks in wild populations with direct and indirect transmission (Full)
+
+#Wild, suburban deer that can interact with captive deer
+
+initial.system <- whitetailedSIRS::initial_compartments(S_wild_prop = 1, I_wild_prop = 0, R_wild_prop = 0, S_captive_prop = 1, I_captive_prop = 0, R_captive_prop = 0, draws = nsamples, steady = FALSE) #Initial conditions for function that reports prevalence and persistence
+
+initial_steady.system <-  whitetailedSIRS::initial_compartments(S_wild_prop = 1, I_wild_prop = 0, R_wild_prop = 0, S_captive_prop = 1, I_captive_prop = 0, R_captive_prop = 0, draws = nsamples, steady = TRUE) #Initial condition for function that reports incidence proportion
+
+#Simulate with just direct (baseline)
+Direct_only.system <- run_direct_and_indirect(iter = nsamples,initial_compartments = initial.system, initial_compartments_steady = initial_steady.system, params = direct.system.params, times = times, name = "Direct, system") #Project outbreaks in wild populations with direct transmission only, including direct transmission across fence lines with captive deer.
+
+#Simulate with all direct and indirect
+Full.system <- run_direct_and_indirect(iter = nsamples,initial_compartments = initial.system, initial_compartments_steady = initial_steady.system, params = full.system.params, times = times, name = "Full, system") #Project outbreaks in wild populations with direct and indirect transmission (Full), including direct transmission across fence lines with captive deer.
+
+end.time <- Sys.time()
+time.taken <- round(end.time - start.time,2)
+time.taken
+```
+
+#### Step 2.c. Summarize probability of infection and Force-Of-Infection (FOI) for various pathways. 
+Note: Created plots will be combined with cumulative FOI plot in Step 2.
+```{r}
+#Create one dataframe with probability of infection and Force of Infection (FOI) for each indirect transmission pathway
+rbind(feed_pile.results %>% 
+  mutate(pathway = "Indirect:\nFeed pile"),
+food_waste.results %>% 
+  mutate(pathway = "Indirect:\nFood waste"),
+WW.results %>% 
+  mutate(pathway = "Indirect:\nContaminated\nwater")) %>% 
+  select(pathway, p_infect,FOI) -> indirect
+
+#Create another dataframe with probability of infection and Force of Infection (FOI) for direct transmission from humans (aerosol transmission)
+tibble(pathway = "Direct:\nAerosols\nfrom human", 
+       p_infect = sigma_aero_deer_human_wild,
+       FOI = sigma_aero_deer_human_wild*omega_hw_wild*I_human_null) -> direct
+
+#Combine direct and indirect transmission summaries into one dataframe
+pathway_risk <- rbind(indirect, direct)
+
+pathway_risk %>% 
+       filter(FOI >0) %>% #Filter out cases with FOI == 0. This happens with contaminated water in simulations where no surface water is contaminated or surface water is not in rivers/streams.
+       mutate(pathway = as.factor(pathway),
+              p_infect = log10(p_infect),
+              FOI = log10(FOI)) -> pathway_risk #Summarize this risk with log-10 transformation
+
+myTheme <- theme(legend.text = element_text(size = 6), 
+                                  legend.title = element_text(size = 8),
+                                  legend.key.size = unit(0.5, 'cm')) #Define theme for distribution plots
+
+#Create plot showing distribution of Force-Of-Infection values estimates for each transmission pathway
+ggplot(pathway_risk,  aes(x = FOI, y = pathway)) +
+  stat_density_ridges(geom = "density_ridges_gradient", calc_ecdf = TRUE, quantiles = 2, quantile_lines = TRUE, scale = 0.9, fill = "white") +
+  scale_x_continuous(breaks = c(-8,-6,-4), name = "Force-of-Infection\n(log10FOI)", limits = c(-15,-3))+
+  ylab("Transmission pathway")+
+  theme_classic()+
+  myTheme+
+  theme(axis.text.y = element_text(size = 6),
+        axis.title.y = element_text(size = 8),
+        axis.text.x = element_text(size = 6),
+        axis.title.x = element_text(size = 8)) -> FOI.dist.plot
+
+#Create plot showing distribution of probability of infection values estimates for each transmission pathway
+ggplot(pathway_risk,  aes(x = p_infect, y = pathway)) +
+  stat_density_ridges(geom = "density_ridges_gradient", calc_ecdf = TRUE, quantiles = 2, quantile_lines = TRUE, scale = 0.9, fill = "white") +
+  scale_x_continuous(breaks = c(-3,-2,-1), labels = c("0.1", "1", "10"), name = "Probability of\ninfection (%)")+
+  theme_classic()+
+  myTheme+
+  theme(axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_text(size = 6),
+        axis.title.x = element_text(size = 8))-> Pinfect.dist.plot
+
+#Estimate proportional difference in median FOI and probability of infection for each pathway, relative to direct, aerosol transmission from humans
+pathway_risk %>% 
+  group_by(pathway) %>% 
+  summarise(., median.FOI = median(10^FOI),
+            median.pInfect = median(10^p_infect)) %>% 
+  mutate(., prop.diff.FOI = median.FOI/median.FOI[which(pathway == "Direct:\nAerosols\nfrom human")],
+         prop.diff.pInfect = median.pInfect/median.pInfect[which(pathway == "Direct:\nAerosols\nfrom human")])
+
+```
+
+#### Step 2.d. Compile cumulative FOI and basic reproductive number R0 for sensitivity analysis.
+
+The code below generates cumulative FOI for each simulation and calculate R0. Cumulative FOI is used to illustrate the increased hazard presented by indirect transmission. These FOI calculations exclude the role of feedpiles.
+```{r}
+#Direct transmission only, wild deer with no captive deer in the system
+#Basic reproductive number (This will be the same for direct transmission and indirect transmission)
+r0.wild <- (direct.wild.params$beta_aero_ww+direct.wild.params$beta_dc_ww)/direct.wild.params$gamma_recov
+
+#Cumulative FOI for direct only (only aerosolized transmission from humans)
+direct_FOI <- data.frame(Run = seq(1,length(direct.wild.params[[1]])), FOI = (direct.wild.params$beta_aero_hw)*I_human_null)
+
+#Format resulting dataframe
+direct_FOI %>% 
+  dplyr::mutate(., Object = paste0("Run ", Run)) %>% 
+  dplyr::select(., -Run) %>% 
+  dplyr::relocate(FOI, .after = Object) %>% 
+  dplyr::mutate(., r0 = r0.wild,
+                  Context = "Direct",
+                  System = "Wild")-> direct_FOI
+
+#Cumulative FOI that includes both indirect and direct transmission, wild deer with no captive deer in the system
+full_FOI <- data.frame(Run = seq(1,length(full.wild.params[[1]])), FOI = full.wild.params$beta_wastewater+((full.wild.params$beta_food_waste+full.wild.params$beta_aero_hw)*I_human_null))
+
+#Format resulting dataframe
+full_FOI %>% 
+  dplyr::mutate(., Object = paste0("Run ", Run)) %>% 
+  dplyr::select(., -Run) %>% 
+  dplyr::relocate(FOI, .after = Object) %>% 
+  dplyr::mutate(., r0 = r0.wild,
+                  Context = "Full",
+                  System = "Wild")-> full_FOI
+
+#Direct transmission only, wild deer are able to interact with captive deer
+#Basic reproductive number (This will be the same for direct transmission and indirect transmission)
+r0.system <- (direct.system.params$beta_aero_ww+direct.system.params$beta_dc_ww)/direct.system.params$gamma_recov
+
+#Cumulative FOI for direct only (only aerosolized transmission from humans)
+direct_FOI.system <- data.frame(Run = seq(1,length(direct.system.params[[1]])), FOI = (direct.system.params$beta_aero_hw)*I_human_null)
+
+#Format resulting dataframe
+direct_FOI.system %>% 
+  dplyr::mutate(., Object = paste0("Run ", Run)) %>% 
+  dplyr::select(., -Run) %>% 
+  dplyr::relocate(FOI, .after = Object) %>% 
+  dplyr::mutate(., r0 = r0.system,
+                  Context = "Direct",
+                  System = "Wild-captive complex")-> direct_FOI_system
+
+#Cumulative FOI that includes both indirect and direct transmission, wild deer with no captive deer in the system
+full_FOI.system <- data.frame(Run = seq(1,length(full.system.params[[1]])), FOI = full.system.params$beta_wastewater+((full.system.params$beta_food_waste+full.system.params$beta_aero_hw)*I_human_null))
+
+#Format resulting dataframe
+full_FOI.system %>% 
+  dplyr::mutate(., Object = paste0("Run ", Run)) %>% 
+  dplyr::select(., -Run) %>% 
+  dplyr::relocate(FOI, .after = Object) %>% 
+  dplyr::mutate(., r0 = r0.system,
+                  Context = "Full",
+                  System = "Wild-captive complex")-> full_FOI_system
+
+#Combine results
+FOI_r0 <- rbind(direct_FOI,full_FOI, direct_FOI_system, full_FOI_system)
+
+#Format results
+FOI_r0 %>% 
+  dplyr::mutate(., Context = factor(Context),
+                   System = factor(System))-> FOI_r0
+
+```
+
+
+#### Step 2.e. Summarize cumulative FOI for simulations considering (i) direct transmission only and (ii) both direct and indirect transmission pathways, and plot!
+
+Below, we characterize cumulative FOI both by raw values and categories (1-4) based on four natural breaks in direct transmission FOI values.
+```{r}
+#Isolate cumulative FOI values for direct transmission only
+breaks.FOI.side <- FOI_r0 %>% filter(Context == "Direct") 
+
+#Define four natural breaks in data
+breaks.side <- BAMMtools::getJenksBreaks(breaks.FOI.side[["FOI"]], k = 4)
+    
+#Assing cumulative FOI categories based on what category simulation values' land in.
+FOI_r0 %>% 
+     mutate(., FOI_class =  case_when(FOI >= breaks.side[[1]] & FOI < breaks.side[[2]] ~ "FOI: 1",
+                                           FOI >= breaks.side[[2]] & FOI < breaks.side[[3]] ~ "FOI: 2",
+                                           FOI >= breaks.side[[3]] & FOI < breaks.side[[4]] ~ "FOI: 3",
+                                           FOI >= breaks.side[[4]] ~ "FOI: 4")) -> r0_FOI_class 
+
+#Organize FOI data and format categorized data
+r0_FOI_class %>% 
+  mutate(., run_id = as.numeric(gsub(".*?([0-9]+).*", "\\1", Object))) %>% 
+  filter(., System == "Wild") %>% 
+  dplyr::select(., c(run_id, FOI_class, FOI, Context)) %>% 
+  mutate(., Context = plyr::revalue(Context, c(Direct = "Direct transmission\nonly", Full = "Direct and indirect\ntransmission")))-> FOI_df_sideplot
+
+#Summarize percentage of simulations that fall within each FOI category for direct transmission only, and direct and indirect transmission. This table will be added to the figure below.
+FOI.dist.tab <- tibble("FOI\nCategory" = c("1", "2", "3", "4"), 
+       "Direct (%)" = round(c(ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct transmission\nonly", "FOI"])(breaks.side[2])*100,(ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct transmission\nonly", "FOI"])(breaks.side[3]) - ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct transmission\nonly", "FOI"])(breaks.side[2]))*100, (ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct transmission\nonly", "FOI"])(breaks.side[4]) - ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct transmission\nonly", "FOI"])(breaks.side[3]))*100, (1 - ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct transmission\nonly", "FOI"])(breaks.side[4]))*100),1),
+       "Direct and\nindirect (%)" = round(c(ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct and indirect\ntransmission", "FOI"])(breaks.side[2])*100,(ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct and indirect\ntransmission", "FOI"])(breaks.side[3]) - ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct and indirect\ntransmission", "FOI"])(breaks.side[2]))*100, (ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct and indirect\ntransmission", "FOI"])(breaks.side[4]) - ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct and indirect\ntransmission", "FOI"])(breaks.side[3]))*100
+, (1 - ecdf(FOI_df_sideplot[FOI_df_sideplot$Context=="Direct and indirect\ntransmission", "FOI"])(breaks.side[4]))*100
+),1))
+
+#Turn above table into a gg object for plotting
+ggpubr::ggtexttable(FOI.dist.tab, rows = NULL, theme = ggpubr::ttheme("blank", base_size = 6, padding = unit(c(2, 2), "mm"))) %>% 
+  ggpubr::tab_add_title(text = "Area under\ncumulative distribution\n", padding = unit(0.1, "line"), face = "bold",size = 8, hjust = c(0)) %>% 
+  ggpubr::tab_add_hline(at.row = c(1,2), linetype = 1, linewidth = 1, linecolor = "black")-> FOI.dist.tab.grob
+
+#Plot cumulative distribution for cumulative FOI for direct transmission only, and direct and indirect transmission. 
+ggplot(FOI_df_sideplot, aes(log10(FOI), color = Context))+
+  stat_ecdf()+
+  scale_x_continuous(breaks = c(log10(breaks.side[1]), log10(breaks.side[2]),log10(breaks.side[3]), log10(breaks.side[4]), max(log10(FOI_df_sideplot$FOI))), labels = scales::label_number(accuracy=0.01), expand = c(0,0))+
+  ylab("")+
+  xlab("Force-of-Infection Category\n(log10FOI)")+
+  scale_color_viridis_d(option = "F", end = 0.9, breaks=c("Direct and indirect\ntransmission","Direct transmission\nonly"))+
+  theme_classic()+
+  geom_rect(aes(xmin=log10(breaks.side[1]), xmax=log10(breaks.side[2]), ymin=-0.1, ymax=-0.01), color = "white", fill = "gray10") + 
+  geom_text(aes(x = (log10(breaks.side[1])+log10(breaks.side[2]))/2, y = -0.05, label = "1"),color = "white", size = 3)+
+  geom_rect(aes(xmin=log10(breaks.side[2]), xmax=log10(breaks.side[3]), ymin=-0.1, ymax=-0.01), color = "white", fill = "gray30") + 
+  geom_text(aes(x = (log10(breaks.side[2])+log10(breaks.side[3]))/2, y = -0.05, label = "2"),color = "white", size = 3)+
+  geom_rect(aes(xmin=log10(breaks.side[3]), xmax=log10(breaks.side[4]), ymin=-0.1, ymax=-0.01), color = "white", fill = "gray50") + 
+  geom_text(aes(x = (log10(breaks.side[3])+log10(breaks.side[4]))/2, y = -0.05, label = "3"),color = "white", size = 3)+
+  geom_rect(aes(xmin=log10(breaks.side[4]), xmax=max(log10(FOI)), ymin=-0.1, ymax=-0.01), color = "white", fill = "gray70") + 
+  geom_text(aes(x = (log10(breaks.side[4])+max(log10(FOI)))/2, y = -0.05, label = "4"),color = "white", size = 3)+
+  coord_cartesian(xlim = c(-7.678472,-2.86), ylim = c(-.05,1))+
+  theme(legend.position = c(0.225,0.8),
+        legend.text = element_text(size=6),
+        legend.title = element_text(size=8),
+        legend.background =  element_rect(fill = NA),
+        axis.title = element_text(size=8),
+        axis.line.x=element_blank(),
+        axis.text.x =element_text(size=6, angle = 90),
+        axis.text.y=element_text(size=6),
+        axis.ticks.x=element_blank(),
+        panel.background=element_blank(),panel.border=element_blank(),panel.grid.major=element_blank(),
+        panel.grid.minor=element_blank(),plot.background=element_blank()) -> FOI_edcf
+
+#Produce Figure 2A
+ggpubr::ggarrange(FOI.dist.plot, Pinfect.dist.plot, nrow = 1, common.legend = TRUE, legend = "bottom", widths = c(1,0.7))+
+  annotate("text", x = 0.05, y = 0.95, label = "A") -> FOIandPinfect
+
+#Produce Figure 2B
+ggpubr::ggarrange(FOI_edcf, FOI.dist.tab.grob, nrow = 1, widths = c(1,0.5)) + annotate("text", x = 0.05, y = 0.99, label = "B") -> FOI_shift
+
+#Produce Figure 2
+ggpubr::ggarrange(FOIandPinfect, FOI_shift, nrow = 2, heights = c(1,0.8)) -> pinfectXFOI.plot
+#Show Figure 2
+pinfectXFOI.plot
+```
+
+## Step 3
+Evaluate sensitivity of outbreaks to FOI and basic reproductive number (R0), and thus identify when increases in FOI from indirect transmission most alter outbreak dynamics of SARS-CoV-2 in deer
+
+#### Step 3.a. Summarize outbreak metrics to related to FOI and R0
+##### Step 3.a.i. Summarize average prevalence 
+```{r}
+# Prevalence
+# Specify the column you want to summarize
+column_to_summarize <- "I_wild"
+
+# Create a dataframe to store the summaries
+summary_dataframe <- data.frame(Object = character(0), Context = character(0), Mean = numeric(0))
+
+#Create function to calculate average daily prevalence, and add to prevalence results (summary_dataframe)
+aggregate.mean.daily.prevalence <- function(dataset) {
+for (i in seq_along(dataset$ode_proj)) {
+  df <- dataset$ode_proj[[i]]
+  mean_value <- mean(df[, column_to_summarize])
+  
+  # Add the summary to the dataframe
+  summary_dataframe <- rbind(summary_dataframe, data.frame(Object = paste("Run", i), Context = unique(dataset$Context), Mean = mean_value))
+}
+  return(summary_dataframe)
+}
+
+#Run code to compile average daily prevalence across four scenarios
+summary_dataframe <- aggregate.mean.daily.prevalence(dataset = Direct_only)
+summary_dataframe <- aggregate.mean.daily.prevalence(dataset = Full)
+summary_dataframe <- aggregate.mean.daily.prevalence(dataset = Direct_only.system)
+summary_dataframe <- aggregate.mean.daily.prevalence(dataset = Full.system)
+
+```
+
+##### Step 3.a.ii. Summarize probability of persistence
+```{r}
+#Define threshold of persistence (0.1%)
+persist.threshold <- 0.001
+
+summary_persist_dataframe <- data.frame(Model = character(0), LCL.95 = numeric(0), mean = numeric(0), UCL.95 = numeric(0))
+
+#Function to calculate and extract binomial probabilities and 80% CIs
+summarize.persistence <- function(data) {
+
+  #Take data function and isolate steady state compartment sizes
+  data %>%
+  dplyr::mutate(steady_sir = map(steady_state, "y")) -> isolate_persistence
+
+  isolate_persistence$steady_sir -> persistance
+
+  # Initialize an empty dataframe
+  combined_df <- data.frame()
+  
+  # Iterate through the elements of the input list
+  for (named_vector in persistance) {
+    # Convert the named vector to a dataframe row
+    row_df <- as.data.frame(t(named_vector))
+    
+    # Combine the row with the existing dataframe
+    combined_df <- rbind(combined_df, row_df)
+  }
+  
+# Create a list with each object containing data from one column
+formatted_persistence <- lapply(combined_df, function(col) {return(col)})
+
+#Creates logical result if simulation exceeds persistence threshold
+formatted_persistence_binary <- formatted_persistence$I_wild > persist.threshold
+
+#Compile results dataframe
+persist_stats <- data.frame(Model = unique(data$Context), LCL.80 = binom::binom.confint(x = sum(formatted_persistence_binary), n = length(formatted_persistence_binary), conf.level = 0.95, methods = "exact")$lower, mean = binom::binom.confint(x = sum(formatted_persistence_binary), n = length(formatted_persistence_binary), conf.level = 0.95, methods = "exact")$mean, UCL.80 = binom::binom.confint(x = sum(formatted_persistence_binary), n = length(formatted_persistence_binary), conf.level = 0.95, methods = "exact")$upper)
+
+return(persist_stats)
+
+}
+
+#use function to create summary dataframe with mean and CL about persistence
+persistence_results <- rbind(summary_persist_dataframe, 
+      summarize.persistence(data = Direct_only), 
+      summarize.persistence(data = Full),
+      summarize.persistence(data = Direct_only.system), 
+      summarize.persistence(data = Full.system))
+
+```
+
+##### Step 3.a.iii. Summarize incidence proportion
+```{r}
+# Specify the column you want to summarize
+column_to_summarize <- "I_wild_cumulative"
+
+# Create a dataframe to store the summaries
+summary_dataframe_IP <- data.frame(Object = character(0), Context = character(0), Mean = numeric(0))
+
+#Create function to calculate incidence proportion, and add to IP results (summary_dataframe)
+aggregate.incidence.proportion <- function(dataset) {
+for (i in seq_along(dataset$ode_proj)) {
+  df <- dataset$ode_proj[[i]]
+  last_value <- last(df[, column_to_summarize])
+  
+  # Add the summary to the dataframe
+  summary_dataframe_IP <- rbind(summary_dataframe_IP, data.frame(Object = paste("Run", i), Context = unique(dataset$Context), Incidence.proportion = last_value))
+}
+  return(summary_dataframe_IP)
+}
+
+#Run code to compile incidence proportion across four scenarios
+summary_dataframe_IP <- aggregate.incidence.proportion(dataset = Direct_only)
+summary_dataframe_IP <- aggregate.incidence.proportion(dataset = Full)
+summary_dataframe_IP <- aggregate.incidence.proportion(dataset = Direct_only.system)
+summary_dataframe_IP <- aggregate.incidence.proportion(dataset = Full.system)
+
+```
+
+#### Step 3.b. Assign FOI and R0 categories to each simulation, to use for sensitivity plots (Figure 3)
+```{r}
+
+#Find natural breaks for FOI with direct transmission only
+breaks.FOI <- FOI_r0 %>% filter(Context == "Direct")
+breaks <- BAMMtools::getJenksBreaks(breaks.FOI[["FOI"]], k = 4)
+
+#Set breaks to results from direct and indirect transmission pathways
+FOI_r0 %>%
+     mutate(., FOI_class =  case_when(FOI >= breaks[[1]] & FOI < breaks[[2]] ~ "FOI: 1",
+                                           FOI >= breaks[[2]] & FOI < breaks[[3]] ~ "FOI: 2",
+                                           FOI >= breaks[[3]] & FOI < breaks[[4]] ~ "FOI: 3",
+                                           FOI >= breaks[[4]] ~ "FOI: 4")) -> r0_FOI_class
+
+
+#Create dataframe with run_id, r0, and FOI for Full scenario
+r0_FOI_class %>%
+  mutate(., run_id = as.numeric(gsub(".*?([0-9]+).*", "\\1", Object))) %>%
+  filter(., Context == "Full", System == "Wild") %>%
+  dplyr::select(., c(run_id, r0, FOI_class)) %>%
+  mutate(., r0_class = case_when(r0 < 0.5 ~ "r0 < 0.5",
+                                 r0 >= 0.5 & r0 <=1 ~ "r0: 0.5-1",
+                                 r0 > 1 & r0 <=2 ~ "r0: 1-2",
+                                 r0 > 2 & r0 <=3 ~ "r0: 2-3",
+                                 r0 > 3 ~ "r0 > 3")) %>%
+  mutate(., r0_class = factor(r0_class, levels = c("r0 < 0.5", "r0: 0.5-1","r0: 1-2", "r0: 2-3", "r0 > 3")))-> full_cat
+
+#Need to rerun persistence calculations with these simulations
+#Define threshold of persistence (0.1%)
+persist.threshold <- 0.001
+
+persist_dataframe <- data.frame(run_id = numeric(0), Context = character(0), Persist = logical(0), r0 = numeric(0))
+
+#Function to calculate and extract binomial probabilities and 80% CIs
+persist_nsamples <- function(data) {
+
+  #Take data function and isolate steady state compartment sizes
+  data %>%
+  dplyr::mutate(steady_sir = map(steady_state, "y")) -> isolate_persistence
+
+  isolate_persistence$steady_sir -> persistance
+
+  # Initialize an empty dataframe
+  combined_df <- data.frame()
+  
+  # Iterate through the elements of the input list
+  for (named_vector in persistance) {
+    # Convert the named vector to a dataframe row
+    row_df <- as.data.frame(t(named_vector))
+    
+    # Combine the row with the existing dataframe
+    combined_df <- rbind(combined_df, row_df)
+  }
+  
+# Create a list with each object containing data from one column
+formatted_persistence <- lapply(combined_df, function(col) {return(col)})
+
+formatted_persistence_binary <- formatted_persistence$I_wild >= persist.threshold
+
+persist_stats <- data.frame(run_id = data$run_id, Context = unique(data$Context), Persist = formatted_persistence_binary, r0 = r0.wild)
+
+return(persist_stats)
+
+}
+
+#Run function to record persitance with r0 for each simulation
+r0_persist <- rbind(persist_nsamples(Full),
+      persist_nsamples(Full.system))
+
+#Extract relevant incidence proportions for each simulation
+summary_dataframe_IP %>% 
+  mutate(., run_id = as.numeric(gsub(".*?([0-9]+).*", "\\1", Object))) %>% 
+  filter(., Context == "Full" | Context == "Full, system") %>% 
+  dplyr::select(., c(run_id, Context, Incidence.proportion)) -> full.IP
+
+#Extract relevant average prevalences for each simulation
+summary_dataframe %>%
+  mutate(., run_id = as.numeric(gsub(".*?([0-9]+).*", "\\1", Object))) %>%
+  filter(., Context == "Full" | Context == "Full, system") %>% 
+  dplyr::select(., c(run_id, Context, Mean)) -> full.prev
+
+#Merge all together (prevalence, persistence, and IP)
+full_cat %>% 
+  merge(., r0_persist[which(r0_persist$Context == "Full" | r0_persist$Context == "Full, system"),], all.x = TRUE) %>% 
+  merge(., full.IP, all.x = TRUE) %>% 
+  merge(., full.prev, all.x = TRUE) %>% 
+  mutate(., Scenario = rep(c("Wild", "Wild-captive complex"),nrow(full_cat))) %>% 
+  dplyr::select(., -run_id, -Context,-r0) -> plot.summary 
+
+#Summarize data for plotting
+plot.summary %>% 
+dplyr::group_by(FOI_class, r0_class, Scenario) %>% 
+  dplyr::reframe(., P.persist = sum(Persist)/length(Persist),
+                 P.persist.LCL = binom::binom.confint(x = sum(Persist), n = length(Persist), methods = "exact")$lower,
+                 P.persist.UCL = binom::binom.confint(x = sum(Persist), n = length(Persist), methods = "exact")$upper,
+                 Prevalence = median(Mean),
+                 Prevalence.LCL = quantile(Mean, probs = c(0.025)),
+                 Prevalence.UCL = quantile(Mean, probs = c(0.975)),
+                 IP = median(Incidence.proportion),
+                 IP.LCL = quantile(Incidence.proportion, probs = c(0.025)),
+                 IP.UCL = quantile(Incidence.proportion, probs = c(0.975))) %>% 
+  dplyr::mutate(FOI_class = plyr::revalue(FOI_class, c("FOI: 1" = "1", "FOI: 2" = "2", "FOI: 3" = "3", "FOI: 4" = "4")),
+                r0_class =  plyr::revalue(r0_class, c("r0 < 0.5" = "R[0] < 0.5", "r0: 0.5-1" = "R[0]: 0.5-1", "r0: 1-2" = "R[0]: 1-2", "r0: 2-3" = "R[0]: 2-3", "r0 > 3" = "R[0] > 3"))) %>% 
+  dplyr::filter(Scenario == "Wild") -> summary.full #option to show only wild scenario
+
+#Plot persistence
+ggplot(summary.full, aes(x= FOI_class, y = log10(P.persist)))+
+  geom_point(aes(shape = Scenario), size = 1, position = position_dodge(width = 1))+
+  geom_errorbar(aes(ymin = log10(P.persist.LCL), ymax = log10(P.persist.UCL), group = Scenario), size = 0.5, width = 0.5, position = position_dodge(width = 1))+
+  facet_grid( ~ r0_class, labeller = label_parsed)+
+  scale_shape_manual(values=c(15, 17))+
+  xlab("Force-Of-Infection category")+
+  scale_y_continuous(breaks = c(-2,-1, -0.30103, 0), labels = c("1%","10%","50%","100%"))+
+  theme_bw()+
+  ylab("Persistence probability")+
+  theme(axis.title.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 5),
+        axis.text.x = element_blank(),
+        strip.text = element_text(size = 6),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        strip.background = element_rect(fill="white"),
+         legend.position = "none") -> Persist.r0.foi.plot
+
+#Plot prevalence
+ggplot(summary.full, aes(x= FOI_class, y = log10(Prevalence)))+
+  geom_point(aes(shape = Scenario), size = 1, position = position_dodge(width = 1))+
+  geom_errorbar(aes(ymin = log10(Prevalence.LCL), ymax = log10(Prevalence.UCL), group = Scenario), size = 0.5, width = 0.5, position = position_dodge(width = 1))+
+  facet_grid( ~ r0_class, labeller = label_parsed)+
+  scale_shape_manual(values=c(15, 17))+
+  xlab("Force-Of-Infection category")+
+  scale_y_continuous(breaks = c(-2, -1.30103, -1), labels = c("  1%", "  5%", "  10%"))+
+  theme_bw()+
+  ylab("Average prevalence")+
+  theme(axis.title.y = element_text(size = 8),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 5),
+        axis.text.x = element_blank(),
+        strip.text = element_text(size = 6),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        strip.background = element_rect(fill="white"),
+        legend.position = "none") -> Prev.r0.foi.plot
+
+#Plot incidence proportion
+ggplot(summary.full, aes(x= FOI_class, y = log10(IP)))+
+  geom_point(aes(shape = Scenario), size = 1, position = position_dodge(width = 1))+
+  geom_errorbar(aes(ymin = log10(IP.LCL), ymax = log10(IP.UCL), group = Scenario), size = 0.5, width = 0.5, position = position_dodge(width = 1))+
+  scale_shape_manual(values=c(15, 17))+
+  facet_grid( ~ r0_class, labeller = label_parsed)+
+  xlab("Force-Of-Infection category")+
+  scale_y_continuous(breaks = c(-1, -0.30103, 0, 0.30103), labels = c("10%","50%","100%","200%"))+
+  theme_bw()+
+  ylab("Incidence proportion")+
+  theme(axis.title.y = element_text(size = 8),
+        axis.title.x = element_text(size = 8),
+        axis.text.y = element_text(size = 5),
+        axis.text.x = element_text(size = 6),
+        strip.text = element_text(size = 6),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        strip.background = element_rect(fill="white"),
+        legend.position = "none") -> IP.r0.foi.plot
+
+#Create Figure 3!
+ggpubr::ggarrange(Prev.r0.foi.plot, Persist.r0.foi.plot, IP.r0.foi.plot, nrow = 3)  
+
+```
+
+Supplemental figure (Figure S2 comparing wild only to system with wild and captive deer). Code runs similar to above chunk, but includes data from both systems.
+```{r}
+summary_dataframe_IP %>% 
+  mutate(., run_id = as.numeric(gsub(".*?([0-9]+).*", "\\1", Object))) %>% 
+  filter(., Context == "Full" | Context == "Full, system") %>% 
+  dplyr::select(., c(run_id, Context, Incidence.proportion)) -> full.IP
+
+summary_dataframe %>%
+  mutate(., run_id = as.numeric(gsub(".*?([0-9]+).*", "\\1", Object))) %>%
+  filter(., Context == "Full" | Context == "Full, system") %>% 
+  dplyr::select(., c(run_id, Context, Mean)) -> full.prev
+
+full_cat %>% 
+  merge(., r0_persist[which(r0_persist$Context == "Full" | r0_persist$Context == "Full, system"),], all.x = TRUE) %>% 
+  merge(., full.IP, all.x = TRUE) %>% 
+  merge(., full.prev, all.x = TRUE) %>% 
+  mutate(., Scenario = rep(c("Wild", "Wild-captive complex"),nsamples)) %>% 
+  dplyr::select(., -run_id, -Context,-r0) -> plot.summary 
+  
+plot.summary %>% 
+dplyr::group_by(FOI_class, r0_class, Scenario) %>% 
+  dplyr::reframe(., P.persist = sum(Persist)/length(Persist),
+                 P.persist.LCL = binom::binom.confint(x = sum(Persist), n = length(Persist), methods = "exact")$lower,
+                 P.persist.UCL = binom::binom.confint(x = sum(Persist), n = length(Persist), methods = "exact")$upper,
+                 Prevalence = median(Mean),
+                 Prevalence.LCL = quantile(Mean, probs = c(0.025)),
+                 Prevalence.UCL = quantile(Mean, probs = c(0.975)),
+                 IP = median(Incidence.proportion),
+                 IP.LCL = quantile(Incidence.proportion, probs = c(0.025)),
+                 IP.UCL = quantile(Incidence.proportion, probs = c(0.975))) %>% 
+  dplyr::mutate(FOI_class = plyr::revalue(FOI_class, c("FOI: 1" = "1", "FOI: 2" = "2", "FOI: 3" = "3", "FOI: 4" = "4")),
+                r0_class =  plyr::revalue(r0_class, c("r0 < 0.5" = "R[0] < 0.5", "r0: 0.5-1" = "R[0]: 0.5-1", "r0: 1-2" = "R[0]: 1-2", "r0: 2-3" = "R[0]: 2-3", "r0 > 3" = "R[0] > 3")))-> summary.full
+
+ggplot(summary.full, aes(x= FOI_class, y = log10(P.persist)))+
+  geom_point(aes(color = Scenario), size = 2, position = position_dodge(width = 1))+
+  geom_errorbar(aes(ymin = log10(P.persist.LCL), ymax = log10(P.persist.UCL), color = Scenario), size = 0.5, width = 0.5, position = position_dodge(width = 1))+
+  facet_grid( ~ r0_class, labeller = label_parsed)+
+  scale_color_manual(values = c("#5ec962", "#3b528b"))+
+  xlab("Force-Of-Infection category")+
+  scale_y_continuous(breaks = c(-1, -0.60206,-0.30103, -0.1249387, 0), labels = c("0.1","0.25","0.5","0.75","1"))+
+  theme_bw()+
+  ylab("Probability of persistence")+
+  theme(axis.title.y = element_text(size = 12),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_blank(),
+        strip.text = element_text(size = 10),
+        title = element_text(size = 12),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        strip.background = element_rect(fill="white"),
+        legend.direction = "horizontal",
+        legend.title = element_text(size = 16),
+        legend.text = element_text(size = 14)) -> Persist.r0.foi.plot
+
+ggplot(summary.full, aes(x= FOI_class, y = log10(Prevalence)))+
+  geom_point(aes(color = Scenario), size = 2, position = position_dodge(width = 1))+
+  geom_errorbar(aes(ymin = log10(Prevalence.LCL), ymax = log10(Prevalence.UCL), color = Scenario), size = 0.5, width = 0.5, position = position_dodge(width = 1))+
+  facet_grid( ~ r0_class, labeller = label_parsed)+
+  scale_color_manual(values = c("#5ec962", "#3b528b"))+
+  xlab("Force-Of-Infection category")+
+  scale_y_continuous(breaks = c(-2, -1.30103, -1), labels = c("  1%", "  5%", "  10%"))+
+  theme_bw()+
+  ylab("Average Prevalence")+
+  theme(axis.title.y = element_text(size = 12),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_blank(),
+        strip.text = element_text(size = 10),
+        title = element_text(size = 12),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        strip.background = element_rect(fill="white"),
+        legend.position = "none") -> Prev.r0.foi.plot
+
+ggplot(summary.full, aes(x= FOI_class, y = log10(IP)))+
+  geom_point(aes(color = Scenario), size = 2, position = position_dodge(width = 1))+
+  geom_errorbar(aes(ymin = log10(IP.LCL), ymax = log10(IP.UCL), color = Scenario), size = 0.5, width = 0.5, position = position_dodge(width = 1))+
+  scale_color_manual(values = c("#5ec962", "#3b528b"))+
+  facet_grid( ~ r0_class, labeller = label_parsed)+
+  xlab("Force-Of-Infection category")+
+  scale_y_continuous(breaks = c(-1, -0.30103, 0, 0.30103), labels = c("0.1","0.5","1","2"))+
+  theme_bw()+
+  ylab("Incidence proportion")+
+  theme(axis.title.y = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(size = 10),
+        strip.text = element_text(size = 10),
+        title = element_text(size = 12),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        strip.background = element_rect(fill="white"),
+        legend.position = "none") -> IP.r0.foi.plot
+
+
+ggpubr::ggarrange(ggpubr::ggarrange(Prev.r0.foi.plot, Persist.r0.foi.plot, IP.r0.foi.plot, nrow = 3, common.legend = TRUE, legend = "bottom"))
+```
+
+## Step 4
+Describe the prevalence and distribution of deer population segments across the contiguous US that may be sensitive to the increased burden of indirect transmission pathways.
+
+#### Step 4.a. Define parameters for exploring and identifying habitat and density conditions that present "risky" R0 values that would be sensitive to unaccounted additions of indirect transmission probabilities.
+```{r Ranch Proximity}
+nWild <- rep(rep(seq(50,1200,by = 50)),nsamples) #Abundance, ranging from 50 - 1200 deer per 100 sq km
+A_w <- 100 #Area
+habitat <- data_frame(wooded_cover = rep(c("12","26","53","67"),3), f = c(rep("10",4), rep("20",4), rep("50",4)), kappa = c(5.97, 4.34, 5.16, 4.59, 15.58, 11.35, 16.37, 15.41, 80.76, 54.17, 71.98, 56.73), q = c(0.2, 0.22, 0.41, 0.5, 0.32, 0.34, 0.53, 0.61, 0.52, 0.51, 0.66, 0.69))#Habitat classification, following parameters estimated by Habib et al. (2011) for various affects of habitat on contact rates.
+
+df <- expand_grid(habitat, nWild, A_w)
+
+df <- arrange(df, nWild)
+                        
+epsilon_dc <- get_EE_param_vals(data = elicitation_data, my_param = "Direct Contact Probability") #Probability of direct contact between deer, given proximity.
+
+C_nu_deer <- 10^5.6 * get_EE_param_vals(data = elicitation_data, my_param = "Viral Load") #viral load in deer saliva, relative to humans (genomic copies per ml)
+
+r_deer <- get_EE_param_vals(data = elicitation_data, my_param = "Dose-Response")# Dose response coefficient for deer and SARS-CoV-2
+
+t_contact_deer_deer_null <- get_EE_param_vals(data = elicitation_data, my_param = "Deer Proximity Duration (minutes)") #Estimate duration of proximity event...
+
+sigma_aero_deer_deer <- calc_sigma_aero(C_nu = C_nu_deer,
+                                        t_contact = t_contact_deer_deer_null / 60,
+                                        r = r_deer, nsamples = nsamples) #...and estimate aerosol transmission
+
+#Infection probability of 0.1 ml of saliva being transferred between deer on contact
+sigma_dc_deer_deer <- calc_sigma_dc(C_nu = C_nu_deer, nsamples = nsamples) #Calculate infection probability
+
+df <- cbind(df, sigma_aero_deer_deer, sigma_dc_deer_deer, epsilon_dc)
+
+#Calculate contact rates and betas
+df %>% 
+  dplyr::rowwise() %>% 
+  dplyr::mutate(omega_ww = whitetailedSIRS::calc_contact_rate(nsamples = 1, kappa = kappa, q = q, N_w = nWild, type_contact = "manual"),
+         gamma_recov = 1/6,
+         beta_aero_ww = omega_ww * sigma_aero_deer_deer,
+         beta_dc_ww = omega_ww * epsilon_dc * sigma_dc_deer_deer,
+         r0 = (beta_aero_ww + beta_dc_ww)/gamma_recov, 
+         Density_sq_km = factor(nWild/A_w),
+         Density_sq_mi = 2.58999*(nWild/A_w),
+         wooded_cover = factor(wooded_cover)) %>% 
+  dplyr::select(., wooded_cover, Density_sq_km, Density_sq_mi, f, kappa, q, r0) -> df
+
+```
+
+#### Step 4.b. Compile 100m pixel data for deer distribution in the U.S. to estimate R0 in each pixel
+Proportion forested data comes from the 2021 NLCD dataset, and density class includes green (<5.8 deer/km2), yellow (5.8 - 11.6 deer/km2), orange (11.6 - 15.4 deer/km2), and red (>17.37deer/km2). This code chunk creates a dataframe listing habitat and deer density values for 100 km^2 pixels across the U.S. deer distribution.
+```{r}
+#Pull in NLCD data for white-tailed deer range
+geo.100km2.df <- read_csv("Data/Hab_100km2.csv")
+
+#Summarize forest cover (NLCD raster values HISTO_41, HISTO_42, HISTO_43, and HISTO_90)
+geo.100km2.df %>% 
+  mutate(Sum_pixels = HISTO_0 + HISTO_11 + HISTO_12 + HISTO_21 + HISTO_22 + HISTO_23 + HISTO_24 + HISTO_31 + HISTO_41 + HISTO_42 + HISTO_43 + HISTO_52 + HISTO_71 + HISTO_81 + HISTO_82 + HISTO_90 + HISTO_95,
+         Prop_forested = (HISTO_41+HISTO_42+HISTO_43+HISTO_90)/Sum_pixels,
+         Prop_forested = (HISTO_41+HISTO_42+HISTO_43+HISTO_90)/Sum_pixels,
+         Class_name = as.factor(Class_name)) %>% 
+  dplyr::filter(Class_name == "Green" | Class_name == "Yellow") %>% #Filter out higher deer density pixels beyond the scope of inference from Habib et al. 2011.
+  dplyr::filter(Prop_forested>=0.05) %>% #Filter out low forested habitat availability beyond the scope of inference from Habib et al. 2011.
+  dplyr::select("Class_name", "Prop_forested") -> summary.100km2.pixel
+
+#How much of deer range does this model help us understand R0?
+
+#Calculate number of 100m pixels with densities <11.6 deer/km2
+geo.100km2.df %>% 
+  mutate(Sum_pixels = HISTO_0 + HISTO_11 + HISTO_12 + HISTO_21 + HISTO_22 + HISTO_23 + HISTO_24 + HISTO_31 + HISTO_41 + HISTO_42 + HISTO_43 + HISTO_52 + HISTO_71 + HISTO_81 + HISTO_82 + HISTO_90 + HISTO_95,
+         Prop_forested = (HISTO_41+HISTO_42+HISTO_43+HISTO_90)/Sum_pixels,
+         Class_name = as.factor(Class_name)) %>% 
+  dplyr::filter(Class_name == "Green" | Class_name == "Yellow") %>% 
+  dplyr::filter(Prop_forested>=0.05) %>% 
+  nrow(.) ->low_density
+#And calculate number of 100m pixels that fall within the bounds of forest habitat measured by Habib et al. 2011.
+geo.100km2.df %>% 
+  mutate(Sum_pixels = HISTO_0 + HISTO_11 + HISTO_12 + HISTO_21 + HISTO_22 + HISTO_23 + HISTO_24 + HISTO_31 + HISTO_41 + HISTO_42 + HISTO_43 + HISTO_52 + HISTO_71 + HISTO_81 + HISTO_82 + HISTO_90 + HISTO_95,
+         Prop_forested = (HISTO_41+HISTO_42+HISTO_43+HISTO_90)/Sum_pixels,
+         Class_name = as.factor(Class_name)) %>% 
+  dplyr::filter(Class_name == "Green" | Class_name == "Yellow") %>% 
+ dplyr::filter(Prop_forested>=0.12 & Prop_forested<=0.67) %>% 
+  nrow(.)/low_density
+
+#Habitat range covers 56% of 100km pixels across range of lower deer densities (<11.6 deer per sq km) with > 5% wooded cover
+```
+
+Summarize what proportion of pixels in the U.S. fall within categories of deer density and forest habitat availability. 
+```{r}
+#First, we break down forested habitat proportions into categories...
+summary.100km2.pixel %>% 
+  dplyr::mutate(forest_bins = case_when(Prop_forested < round(0.12,2) ~ "5",
+                                        Prop_forested >= round(0.12,2) & Prop_forested <round(0.26,2) ~ "12",
+                                        Prop_forested >= round(0.26,2) & Prop_forested <round(0.53,2) ~ "26",
+                                        Prop_forested >= round(0.53,2) & Prop_forested <round(0.67,2) ~ "53",
+                                        Prop_forested >= round(0.67,2) & Prop_forested <round(0.80,2) ~ "67",
+                                        Prop_forested >= round(0.80,2) & Prop_forested <=round(1.00,2) ~ "80")) %>%  
+  dplyr::mutate(forest_bins = factor(forest_bins, levels = c("5", "12", "26", "53", "67", "80"))) ->binned_summary_1
+
+#...and calculate the proportion of pixels under each density/habitat category
+binned_summary_1 %>%   
+  dplyr::group_by(Class_name, forest_bins) %>% 
+  dplyr::summarise(count = 100*(n()/26218)) %>% 
+  dplyr::mutate(forest_bins = as.numeric(as.character(forest_bins)))  -> binned_summary_2
+
+```
+
+#### Step 4.c. Estimate relationship between R0, forested cover, and deer density, to interpolate entire range of deer densities and forested cover within the range explored by Habib et al. 2011.
+```{r}
+#Prepare dataframe for regression
+df %>% 
+  select(Density_sq_km, wooded_cover, r0) %>% 
+  mutate(Density_sq_km = as.numeric(as.character(Density_sq_km)),
+         wooded_cover = as.numeric(as.character(wooded_cover))) -> reg.df
+
+#Fit three linear regression models...
+m1 <- glm(log(r0) ~ wooded_cover+log(Density_sq_km), data = reg.df)
+m2 <- glm(log(r0) ~ poly(wooded_cover,2)*log(Density_sq_km), data = reg.df)
+m3 <- glm(log(r0) ~ log(wooded_cover)*log(Density_sq_km), data = reg.df)
+
+#And identify the best supported model given the data.
+MuMIn::AICc(m1, m2, m3) #M2 is best
+
+m2$deviance/m2$null.deviance #Pseudo R2 for model 2 is 0.726
+
+#predict using m2 to interpolate across all requested values
+new.df <- expand_grid(wooded_cover = seq(12, 67, by = 1), Density_sq_km = seq(1, 12, length.out = 100))
+
+#Bind prediction dataframe with predicted median R0, with 95% CIs.
+pred.df <- cbind(new.df, exp(predict(m2, new.df)), exp(predict(m2, new.df)-(1.96*(predict(m2, new.df, se.fit = TRUE)$se.fit))), exp(predict(m2, new.df)+(1.96*(predict(m2, new.df, se.fit = TRUE)$se.fit))))
+colnames(pred.df)[3:5] <- c("r0.pred","r0.LCL", "r0.UCL") 
+```
+
+Bring probabilities of r0 ranging between 0.5-1 by density class and forest cover in raster for mapping and summarizing risk across the U.S.
+```{r}
+pred.df %>% #Take the prediction data...
+  mutate(Wooded_cover = as.factor(wooded_cover),
+         Density_sq_km = as.factor(Density_sq_km), #...format covariates...
+         r0.cat = case_when(r0.pred >0.5 & r0.pred <= 1 ~ "2",
+                            r0.pred <= 0.5 ~ "1",
+                            r0.pred > 1 ~ "0")) %>% #...categorize R0...
+  mutate(Density_sq_km = as.numeric(as.character(Density_sq_km))) %>%
+  filter(round(Density_sq_km,2)<=11.6) %>% #...filter out deer densities greater than those covered by the Habib et al. (2011) model...
+  mutate(Class_name = case_when(Density_sq_km >=1 & round(Density_sq_km,2) < 5.80 ~ "Green",
+                                Density_sq_km >= 5.80 ~ "Yellow")) %>% #...categorize density classes,...
+  group_by(Class_name, Wooded_cover) %>% 
+  summarise(Prob.risk.r0 = sum(r0.cat == 2, na.rm=T) / n(),
+            Prob.r0.low = sum(r0.cat == 1, na.rm=T) / n(),
+            Prob.r0.high = sum(r0.cat == 0, na.rm=T) / n()) %>% #...summarize proportion of pixels under each R0 value.
+  mutate(Wooded_cover = as.numeric(as.character(Wooded_cover)))-> pixel.calc
+
+geo.100km2.df %>% #Take the pixel data for habitat and deer densities...
+  mutate(Sum_pixels = HISTO_0 + HISTO_11 + HISTO_12 + HISTO_21 + HISTO_22 + HISTO_23 + HISTO_24 + HISTO_31 + HISTO_41 + HISTO_42 + HISTO_43 + HISTO_52 + HISTO_71 + HISTO_81 + HISTO_82 + HISTO_90 + HISTO_95,
+         Prop_forested = (HISTO_41+HISTO_42+HISTO_43+HISTO_90)/Sum_pixels, #...calculate the proportion of pixel that is forested
+         Class_name = as.factor(Class_name)) %>% 
+  dplyr::mutate(Wooded_cover = round(Prop_forested*100,0)) %>% 
+  merge(., pixel.calc, by = c("Class_name", "Wooded_cover"), all.x = TRUE) -> geo.100km2.df.withrisk #and merge with pixel.count to add predicted median R0
+
+#Filter pixels outside of Habib et al. (2011) model bounds
+geo.100km2.df.withrisk %>% 
+  filter(is.na(Prob.risk.r0),
+         Class_name == "Green" | Class_name == "Yellow",
+         Wooded_cover >12) -> summary.risk.within.model
+
+head(summary.risk.within.model)
+
+#Export Data for mapping with GIS software. This file is used to create Figure 5 in the manuscript in a GIS program (i.e. QGIS)
+#write.csv(geo.100km2.df.withrisk, "Data/geo.100km2.df.withrisk.csv")
+```
+
+#### Step 4.d. Create Figure 4
+Figure 4 displays 1) how R0 is predicted to vary across combinations of wooded habitat availability and deer densities, 2) the proportion of pixels in deer density:wooded habitat categories, and 3) the proportion of pixels in each U.S. state (within deer range) that fall within the "risky" R0 range.
+
+```{r}
+#Figure 4a: How does median R0 vary across combinations of deer density and wooded habitat availability?
+pred.df %>% 
+  mutate(wooded_cover = as.factor(wooded_cover),
+         Density_sq_km = as.factor(Density_sq_km),
+         r0.cat = case_when(r0.pred >0.5 & r0.pred <= 1 ~ "2",
+                            r0.pred <= 0.5 ~ "1",
+                            r0.pred > 1 ~ "0")) %>% 
+  mutate(wooded_cover = as.numeric(as.character(wooded_cover)),
+         Density_sq_km = as.numeric(as.character(Density_sq_km))) %>% 
+  filter(round(Density_sq_km,2)<=11.6) %>% 
+  ggplot(., aes(Density_sq_km, wooded_cover, fill = r0.cat))+
+  geom_tile(alpha = 0.8, color = NA)+
+  scale_fill_manual(values=c("darkorange4","darkorange","gray50"), breaks = c("1","2","0"), name = bquote("Predicted median" ~R[0]), labels = c("<0.5","0.5-1",">1"), guide = guide_legend(
+      direction = "horizontal",
+      title.position = "top",
+      ))+
+  theme_classic()+
+  labs(x = bquote('Deer/'~km^2), y = "Wooded habitat (%)", title = "A")+
+  coord_cartesian(xlim = c(0,12), expand = c(0))+
+  annotate("rect", xmin = 1, xmax = 12, ymin = 67.5, ymax = 100, 
+           alpha = .1)+
+  annotate("rect", xmin = 0, xmax = 1, ymin = 0, ymax = 100, 
+           alpha = .1)+
+  annotate("rect", xmin = 1, xmax = 12, ymin = 0, ymax = 12, 
+           alpha = .1)+
+  annotate("rect", xmin = 11.6, xmax = 12, ymin = 12, ymax = 67.5, 
+           alpha = .1)+
+  annotate("text", x = 6, y = 80, label = "Outside of model bounds", size = 2, alpha = 0.4)+
+  annotate("segment", x = 1, xend = 11.6, y = 26, yend = 26)+
+  annotate("segment", x = 1, xend = 11.6, y = 53, yend = 53)+
+  annotate("segment", x = 5.8, xend = 5.8, y = 12, yend = 67)+
+  theme(axis.title = element_text(size = 8),
+        axis.text = element_text(size = 6),
+        axis.title.y = element_text(margin = margin(t = 0, r = -4, b = 0, l = 0)),
+        legend.title = element_text(size = 6),
+        legend.text = element_text(size = 6),
+        legend.position="bottom",
+        legend.key.size = unit(0.5,"line"))->pred.r0.habXdensity.plot.v2
+
+#Figure 4b: What proportion of the deer range fall within the bounds of the predictive model used here?
+binned_summary_1 %>% 
+  merge(binned_summary_2, by = c("Class_name", "forest_bins")) %>% 
+  select(-forest_bins) %>% 
+  mutate(Prop.forested.round = round(Prop_forested,2)*100,
+         Class_name = as.factor(Class_name),
+         Class_name = recode_factor(Class_name, Green = "1 - 5.8", Yellow = "5.8 - 11.6")) %>% 
+  ggplot(., aes(Class_name, Prop.forested.round, fill = count)) +
+  geom_raster()+
+  scale_y_continuous(breaks = c(0,25,50,75,100), expand = c(0,0), limits = c(0,100))+
+  labs(x = bquote('Deer/'~km^2), y = "Wooded habitat (%)", title = "B")+
+  geom_hline(yintercept = 12, color = "white", linetype = "dashed")+
+  geom_hline(yintercept = 67, color = "white", linetype = "dashed")+
+  theme_classic()+
+  scale_fill_steps(name = "Area (%)")+
+  theme(axis.title = element_text(size = 8),
+        axis.text = element_text(size = 6),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        legend.title = element_text(size = 6),
+        legend.text = element_text(size = 6),
+        legend.position = "bottom", 
+        legend.key.height = unit(0.37, "cm"),
+        legend.margin=margin(0,0,0,0))+
+  guides(fill = guide_colourbar(title.position = "top",
+                                title.hjust = .5,
+                                label.position = "bottom"))-> rel.abund.habXdensity.plot.v2
+
+#Figure 4c: How does median R0 vary across combinations of deer density and wooded habitat availability?
+geo.100km2.df %>% 
+  mutate(Sum_pixels = HISTO_0 + HISTO_11 + HISTO_12 + HISTO_21 + HISTO_22 + HISTO_23 + HISTO_24 + HISTO_31 + HISTO_41 + HISTO_42 + HISTO_43 + HISTO_52 + HISTO_71 + HISTO_81 + HISTO_82 + HISTO_90 + HISTO_95,
+         Prop_forested = (HISTO_41+HISTO_42+HISTO_43+HISTO_90)/Sum_pixels,
+         Class_name = as.factor(Class_name)) %>% 
+  dplyr::mutate(Wooded_cover = round(Prop_forested*100,0)) %>% 
+  merge(., pixel.calc, by = c("Class_name", "Wooded_cover"), all.x = TRUE) %>% 
+  mutate(state_code = c(state.abb, 'DC')[match(NAME, c(state.name, 'District of Columbia'))]) %>% 
+  select(., "Class_name", "Wooded_cover", "state_code", "Prop_forested", "Prob.risk.r0") %>% 
+  group_by(., state_code) %>% 
+  summarise(., Proportion.risk = sum(Prob.risk.r0>0, na.rm = TRUE)/n(),
+               Proportion.conditions = 1-(sum(is.na(Prob.risk.r0))/n())) %>% 
+  filter(state_code != "NV" & state_code != "DC") %>%  #Remove Nevada as a pixel issue
+  ggplot(., aes(x = fct_reorder(state_code, Proportion.conditions), y = Proportion.conditions, fill = "Proportion.conditions", color = "Proportion.conditions"))+
+  geom_col(position = "identity") +
+  geom_col(aes(fct_reorder(state_code, Proportion.conditions), y = Proportion.risk, fill = "Proportion.risk", color = "Proportion.risk"))+
+  coord_flip() +
+  scale_fill_manual(values=c("Proportion.risk" = "darkorange","Proportion.conditions" = "white"), name = NULL , labels = c("Within model coverage", "Sensitive to FOI"), guide = guide_legend(
+      title.position = "top", label.position = "right", reverse = TRUE, direction = "vertical", ))+
+  scale_color_manual(values=c("Proportion.risk" = "black","Proportion.conditions" = "black"), name = NULL , labels = c("Within model coverage", "Sensitive to FOI"), guide = guide_legend(
+      title.position = "top", label.position = "right", reverse = TRUE, direction = "verticle", ))+
+  xlab("State") +
+  ylab("Proportion deer range") +
+  labs(title = "C", ) +
+  theme_classic() +
+  theme(plot.title.position = "plot",
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 6),
+        legend.title = element_text(size = 6),
+        legend.text = element_text(size = 6),
+        legend.position="bottom",
+        legend.key.height = unit(0.29, "cm"),
+        legend.key.size = unit(0.5,"line"))-> state_risk_plot
+
+
+#Create Figure 4
+ggpubr::ggarrange(pred.r0.habXdensity.plot.v2, rel.abund.habXdensity.plot.v2, state_risk_plot,nrow = 1, widths = c(0.33,0.33))
+```
+
+## Literature Cited
+
+- Ehalt Macedo, H., Lehner, B., Nicell, J., Grill, G., Li, J., Limtong, A. and Shakya, R., 2022. Distribution and characteristics of wastewater treatment plants within the global river network. Earth System Science Data, 14(2), pp.559-577.
+
+- Habib TJ, Merrill EH, Pybus MJ, Coltman DW. Modelling landscape effects on density–contact rate relationships of deer in eastern Alberta: implications for chronic wasting disease. Ecological Modelling 2011;222(15): 2722-2732.
+
+- Karababa, E. and Coşkuner, Y., 2007. Moisture dependent physical properties of dry sweet corn kernels. International Journal of Food Properties, 10(3), pp.549-560.
+
+- Khouri RM, Wagner DC, Walter WD. Efficacy of secondary electric fences at preventing direct contact among white‐tailed deer. Wildlife Society Bulletin. 2022 Sep;46(4):e1350.
+
+- 24.	Rosenblatt, E.G., Cook, J.D., DiRenzo, G.V., Grant, E.H., Arce, F., Pepin, K.M., Rudolph, F.J., Runge, M.C., Shriner, S., Walsh, D.P. and Mosher, B.A., 2024. Epidemiological modeling of SARS-CoV-2 in white-tailed deer (Odocoileus virginianus) reveals conditions for introduction and widespread transmission. PLOS Compuational Biology, 20(7), e1012263.
+
+- Rosenblatt E, Rudolph JF, Arce F, Cook JD, DiRenzo GV, Grant EHC, et al. whitetailedSIRS: A package to project SARS-CoV-2 outbreak dynamics in white-tailed deer. Version 1.0.0: U.S. Geological Survey software release. https://doi.org/10.5066/P9TZK938. 2023.
+
+- Vercauteren KC, Lavelle MJ, Seward NW, Fischer JW, Phillips GE. Fence‐line contact between wild and farmed white‐tailed deer in Michigan: potential for disease transmission. The Journal of wildlife management. 2007 Jul;71(5):1603-6.
+
+- Walters, Brian F.; Woodall, Christopher W.; Russell, Matthew B. (2016). White-tailed deer density estimates across the eastern United States, 2008. Retrieved from the University Digital Conservancy, http://dx.doi.org/10.13020/D6G014.
+
