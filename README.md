@@ -1,14 +1,5 @@
 # Code for "Fomites could determine severity of SARS-CoV-2 outbreaks in low-density white-tailed deer (Odocoileus virginianus) populations"
 
-## Authors
-
-- **Elias G. Rosenblatt**, (erosenbl\@uvm.edu), Rubenstein School of Environment and Natural Resources, University of Vermont, Burlington, Vermont, United States of America
-- **Jonathan D. Cook**, U.S. Geological Survey, Eastern Ecological Science Center, Laurel, Maryland, United States of America
-- **Graziella V. DiRenzo**, U.S. Geological Survey, Massachusetts Cooperative Fish and Wildlife Research Unit, University of Massachusetts, Amherst, Massachusetts, United States of America; Department of Environmental Conservation, University of Massachusetts, Amherst, Massachusetts, USA
-- **Evan H. Campbell Grant**, U.S. Geological Survey, Eastern Ecological Science Center, Turner’s Falls, Massachusetts, United States of America
-- **Michael C. Runge**, U.S. Geological Survey, Eastern Ecological Science Center, Laurel, Maryland, United States of America
-- **Brittany A. Mosher**, Rubenstein School of Environment and Natural Resources, University of Vermont, Burlington, Vermont, United States of America
-
 ## Information
 
 Repository Type: Program R script
@@ -21,13 +12,9 @@ Version: 1.0.0
 
 Digital Object Identifier (DOI): https://doi.org/10.5066/P19KKRVV
 
-USGS Information Product Data System (IPDS) no.:IP-167795 (internal agency tracking)
-
-## Suggested Citation for Software
-Rosenblatt, E., Cook, J.D., DiRenzo, G.V., Grant, E.H.C., Runge, M.C., Mosher, B.A. Code for "Fomites could determine severity of SARS-CoV-2 outbreaks in low-density white-tailed deer (Odocoileus virginianus) populations." Version 1.0.0; U.S. Geological Survey software release. Reston, VA. 
-
 ### Overview
-This software release contains 1 RMarkdown file (Indirect_SARS_analysis.RMD) and necessary input data and functions that support the analysis presented in referenced manuscript (IP-166277).  This RMarkdown file that steps through the estimation of parameters that allow:
+This software release contains 1 RMarkdown file (Indirect_SARS_analysis.RMD) and necessary input data and functions that support the analysis presented in referenced manuscript. This RMarkdown file that steps through the estimation of parameters that allow:
+
 1.  Compile estimated and derived parameters for both indirect and direct transmission pathways for SARS-CoV-2 in white-tailed deer and humans;
 2.  Project outbreaks using SIRS ODEs modified from the whitetailedSIRS package (Rosenblatt et al. 2023), and estimate cumulative Force of Infection (FOI) considering both direct and indirect transmission pathways;
 3.  Evaluate sensitivity of outbreaks to FOI and basic reproductive number (R0), and thus identify when increases in FOI from indirect transmission most alter outbreak dynamics of SARS-CoV-2 in deer;
